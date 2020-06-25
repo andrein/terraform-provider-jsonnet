@@ -33,7 +33,6 @@ func TestAccJsonnet_jpath(t *testing.T) {
 	})
 }
 
-
 func testCheckResourceJsonAttr(name, key, value string) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		actual := s.RootModule().Resources[name].Primary.Attributes[key]
@@ -49,10 +48,10 @@ func testCheckResourceJsonAttr(name, key, value string) resource.TestCheckFunc {
 			return fmt.Errorf("Input ('%s') needs to be valid json.\nJSON parsing error: '%s'", actual, err.Error())
 		}
 
-		if ! reflect.DeepEqual(expectedJSONAsInterface, actualJSONAsInterface) {
-			return fmt.Errorf("%s: Attribute '%s': \n" +
-			"expected: %s\n" +
-			"actual  : %s", name, key, expected, actual)
+		if !reflect.DeepEqual(expectedJSONAsInterface, actualJSONAsInterface) {
+			return fmt.Errorf("%s: Attribute '%s': \n"+
+				"expected: %s\n"+
+				"actual  : %s", name, key, expected, actual)
 		}
 
 		return nil

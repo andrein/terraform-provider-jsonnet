@@ -12,29 +12,29 @@ func dataSourceJsonnetTemplate() *schema.Resource {
 		Read: dataSourceJsonnetTemplateRead,
 
 		Schema: map[string]*schema.Schema{
-			"jsonnet": &schema.Schema{
-				Type:     schema.TypeString,
+			"jsonnet": {
+				Type:        schema.TypeString,
 				Description: "The Jsonnet input",
-				Required: true,
+				Required:    true,
 			},
-			"jpath": &schema.Schema{
-				Type:     schema.TypeList,
+			"jpath": {
+				Type:        schema.TypeList,
 				Description: "The Jsonnet additional library search dir",
-				Optional: true,
+				Optional:    true,
 				Elem: &schema.Schema{
 					Type: schema.TypeString,
 				},
 			},
-			"json": &schema.Schema{
-				Type:	schema.TypeString,
+			"json": {
+				Type:        schema.TypeString,
 				Description: "The JSON output",
-				Computed: true,
+				Computed:    true,
 			},
 		},
 	}
 }
 
-func dataSourceJsonnetTemplateRead(d *schema.ResourceData, m interface{}) error {
+func dataSourceJsonnetTemplateRead(d *schema.ResourceData, _ interface{}) error {
 	vm := jsonnet.MakeVM()
 
 	if jpath := d.Get("jpath").([]interface{}); jpath != nil {
@@ -47,8 +47,9 @@ func dataSourceJsonnetTemplateRead(d *schema.ResourceData, m interface{}) error 
 		return err
 	}
 
-
-	d.Set("json", json)
+	if err = d.Set("json", json); err != nil {
+		return err
+	}
 
 	sha := sha256.Sum256([]byte(json))
 	d.SetId(hex.EncodeToString(sha[:]))
