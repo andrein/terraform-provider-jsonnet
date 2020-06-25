@@ -49,3 +49,6 @@ override.tf.json
 terraform.rc
 
 terraform-provider-jsonnet
+
+# goreleaser dist
+dist/
