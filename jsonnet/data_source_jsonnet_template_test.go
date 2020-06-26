@@ -33,6 +33,38 @@ func TestAccJsonnet_jpath(t *testing.T) {
 	})
 }
 
+func TestAccJsonnet_ext(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccJsonnetTemplate_ext_var,
+				Check:  testCheckResourceJsonAttr("data.jsonnet_template.test", "json", `{"result": "test"}`),
+			},
+			{
+				Config: testAccJsonnetTemplate_ext_code,
+				Check:  testCheckResourceJsonAttr("data.jsonnet_template.test", "json", `{"result": "test"}`),
+			},
+		},
+	})
+}
+
+func TestAccJsonnet_tla(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccJsonnetTemplate_tla_var,
+				Check:  testCheckResourceJsonAttr("data.jsonnet_template.test", "json", `{"result": "test"}`),
+			},
+			{
+				Config: testAccJsonnetTemplate_tla_code,
+				Check:  testCheckResourceJsonAttr("data.jsonnet_template.test", "json", `{"result": "test"}`),
+			},
+		},
+	})
+}
+
 func testCheckResourceJsonAttr(name, key, value string) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		actual := s.RootModule().Resources[name].Primary.Attributes[key]
@@ -79,5 +111,53 @@ data "jsonnet_template" "test" {
   {} + test.withResult(result)
   EOF
   jpath = ["test-fixtures"]
+}
+`
+
+var testAccJsonnetTemplate_ext_var = `
+data "jsonnet_template" "test" {
+  jsonnet = <<-EOF
+  { result: std.extVar('result') }
+  EOF
+  ext_var = {
+	result = "test"
+  }
+}
+`
+
+var testAccJsonnetTemplate_ext_code = `
+data "jsonnet_template" "test" {
+  jsonnet = <<-EOF
+  { result: std.extVar('result') }
+  EOF
+  ext_code = {
+	result = "'test'"
+  }
+}
+`
+
+var testAccJsonnetTemplate_tla_var = `
+data "jsonnet_template" "test" {
+  jsonnet = <<-EOF
+  function(result) {
+	result: result
+  }
+  EOF
+  tla_var = {
+	result = "test"
+  }
+}
+`
+
+var testAccJsonnetTemplate_tla_code = `
+data "jsonnet_template" "test" {
+  jsonnet = <<-EOF
+  function(result) {
+	result: result
+  }
+  EOF
+  tla_code = {
+	result = "'test'"
+  }
 }
 `
