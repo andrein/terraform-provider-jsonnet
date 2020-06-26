@@ -3,7 +3,7 @@ module github.com/andrein/terraform-provider-jsonnet
 go 1.13
 
 require (
-	github.com/google/go-jsonnet v0.15.0
+	github.com/google/go-jsonnet v0.16.0
 	github.com/hashicorp/terraform-plugin-sdk v1.11.0
 	github.com/kisielk/errcheck v1.3.0 // indirect
 	golang.org/x/mod v0.3.0 // indirect
