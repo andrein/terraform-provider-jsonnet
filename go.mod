@@ -4,5 +4,5 @@ go 1.13
 
 require (
 	github.com/google/go-jsonnet v0.17.0
-	github.com/hashicorp/terraform-plugin-sdk v1.16.0
+	github.com/hashicorp/terraform-plugin-sdk v1.17.2
 )
