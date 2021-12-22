@@ -19,6 +19,7 @@ package jsonnet
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"math"
 	"reflect"
 	"sort"
@@ -35,9 +36,9 @@ type environment struct {
 
 	// Bindings introduced in this frame. The way previous bindings are treated
 	// depends on the type of a frame.
-	// If isCall == true then previous bindings are ignored (it's a clean
+	// If cleanEnv == true then previous bindings are ignored (it's a clean
 	// environment with just the variables we have here).
-	// If isCall == false then if this frame doesn't contain a binding
+	// If cleanEnv == false then if this frame doesn't contain a binding
 	// previous bindings will be used.
 	upValues bindingFrame
 }
@@ -52,7 +53,7 @@ func makeEnvironment(upValues bindingFrame, sb selfBinding) environment {
 func (i *interpreter) getCurrentStackTrace() []traceFrame {
 	var result []traceFrame
 	for _, f := range i.stack.stack {
-		if f.isCall {
+		if f.cleanEnv {
 			result = append(result, traceElementToTraceFrame(f.trace))
 		}
 	}
@@ -65,8 +66,7 @@ func (i *interpreter) getCurrentStackTrace() []traceFrame {
 type callFrame struct {
 	// True if it switches to a clean environment (function call or array element)
 	// False otherwise, e.g. for local
-	// This makes callFrame a misnomer as it is technically not always a call...
-	isCall bool
+	cleanEnv bool
 
 	// Tracing information about the place where it was called from.
 	trace traceElement
@@ -87,8 +87,8 @@ func dumpCallFrame(c *callFrame) string {
 	} else {
 		loc = *c.trace.loc
 	}
-	return fmt.Sprintf("<callFrame isCall = %t location = %v trimmable = %t>",
-		c.isCall,
+	return fmt.Sprintf("<callFrame cleanEnv = %t location = %v trimmable = %t>",
+		c.cleanEnv,
 		loc,
 		c.trimmable,
 	)
@@ -121,7 +121,7 @@ func (s *callStack) top() *callFrame {
 // of the frame we want to pop.
 func (s *callStack) popIfExists(whichFrame int) {
 	if len(s.stack) == whichFrame {
-		if s.top().isCall {
+		if s.top().cleanEnv {
 			s.calls--
 		}
 		s.setCurrentTrace(s.stack[len(s.stack)-1].trace)
@@ -132,7 +132,7 @@ func (s *callStack) popIfExists(whichFrame int) {
 /** If there is a trimmable frame followed by some locals, pop them all. */
 func (s *callStack) tailCallTrimStack() {
 	for i := len(s.stack) - 1; i >= 0; i-- {
-		if s.stack[i].isCall {
+		if s.stack[i].cleanEnv {
 			if !s.stack[i].trimmable {
 				return
 			}
@@ -167,7 +167,7 @@ func (s *callStack) newCall(env environment, trimmable bool) {
 		panic("Saving empty traceElement on stack")
 	}
 	s.stack = append(s.stack, &callFrame{
-		isCall:    true,
+		cleanEnv:  true,
 		trace:     s.currentTrace,
 		env:       env,
 		trimmable: trimmable,
@@ -187,7 +187,7 @@ func (s *callStack) newLocal(vars bindingFrame) {
 // getSelfBinding resolves the self construct
 func (s *callStack) getSelfBinding() selfBinding {
 	for i := len(s.stack) - 1; i >= 0; i-- {
-		if s.stack[i].isCall {
+		if s.stack[i].cleanEnv {
 			return s.stack[i].env.selfBinding
 		}
 	}
@@ -201,7 +201,7 @@ func (s *callStack) lookUpVar(id ast.Identifier) *cachedThunk {
 		if present {
 			return bind
 		}
-		if s.stack[i].isCall {
+		if s.stack[i].cleanEnv {
 			// Nothing beyond the captured environment of the thunk / closure.
 			break
 		}
@@ -258,6 +258,9 @@ type interpreter struct {
 
 	// Keeps imports
 	importCache *importCache
+
+	// Output stream for trace() for
+	traceOut io.Writer
 }
 
 // Map union, b takes precedence when keys collide.
@@ -654,6 +657,15 @@ func (i *interpreter) manifestJSON(v value) (interface{}, error) {
 	if i.stack.currentTrace == (traceElement{}) {
 		panic("manifesting JSON with empty traceElement")
 	}
+
+	// Fresh frame for better stack traces
+	err := i.newCall(environment{}, false)
+	if err != nil {
+		return nil, err
+	}
+	stackSize := len(i.stack.stack)
+	defer i.stack.popIfExists(stackSize)
+
 	switch v := v.(type) {
 
 	case *valueBoolean:
@@ -673,16 +685,23 @@ func (i *interpreter) manifestJSON(v value) (interface{}, error) {
 
 	case *valueArray:
 		result := make([]interface{}, 0, len(v.elements))
-		for _, th := range v.elements {
+		for index, th := range v.elements {
+			msg := ast.MakeLocationRangeMessage(fmt.Sprintf("Array element %d", index))
+			i.stack.setCurrentTrace(traceElement{
+				loc: &msg,
+			})
 			elVal, err := i.evaluatePV(th)
 			if err != nil {
+				i.stack.clearCurrentTrace()
 				return nil, err
 			}
 			elem, err := i.manifestJSON(elVal)
 			if err != nil {
+				i.stack.clearCurrentTrace()
 				return nil, err
 			}
 			result = append(result, elem)
+			i.stack.clearCurrentTrace()
 		}
 		return result, nil
 
@@ -690,24 +709,37 @@ func (i *interpreter) manifestJSON(v value) (interface{}, error) {
 		fieldNames := objectFields(v, withoutHidden)
 		sort.Strings(fieldNames)
 
+		msg := ast.MakeLocationRangeMessage("Checking object assertions")
+		i.stack.setCurrentTrace(traceElement{
+			loc: &msg,
+		})
 		err := checkAssertions(i, v)
 		if err != nil {
+			i.stack.clearCurrentTrace()
 			return nil, err
 		}
+		i.stack.clearCurrentTrace()
 
 		result := make(map[string]interface{})
 
 		for _, fieldName := range fieldNames {
+			msg := ast.MakeLocationRangeMessage(fmt.Sprintf("Field %#v", fieldName))
+			i.stack.setCurrentTrace(traceElement{
+				loc: &msg,
+			})
 			fieldVal, err := v.index(i, fieldName)
 			if err != nil {
+				i.stack.clearCurrentTrace()
 				return nil, err
 			}
 
 			field, err := i.manifestJSON(fieldVal)
 			if err != nil {
+				i.stack.clearCurrentTrace()
 				return nil, err
 			}
 			result[fieldName] = field
+			i.stack.clearCurrentTrace()
 		}
 
 		return result, nil
@@ -944,10 +976,13 @@ func (i *interpreter) EvalInCleanEnv(env *environment, ast ast.Node, trimmable b
 	stackSize := len(i.stack.stack)
 
 	val, err := i.evaluate(ast, tailCall)
+	if err != nil {
+		return nil, err
+	}
 
 	i.stack.popIfExists(stackSize)
 
-	return val, err
+	return val, nil
 }
 
 func (i *interpreter) evaluatePV(ph potentialValue) (value, error) {
@@ -1148,8 +1183,16 @@ func buildStdObject(i *interpreter) (*valueObject, error) {
 }
 
 func evaluateStd(i *interpreter) (value, error) {
+	// We are bootstrapping std before it is properly available.
+	// We need "$std" for desugaring.
+	// So, we're creating an empty thunk (evaluating will panic).
+	// We will fill it manually before it's evaluated, though.
+	// This "std" does not have std.thisFile.
+	stdThunk := &cachedThunk{}
 	beforeStdEnv := makeEnvironment(
-		bindingFrame{},
+		bindingFrame{
+			"$std": stdThunk,
+		},
 		makeUnboundSelfBinding(),
 	)
 	evalLoc := ast.MakeLocationRangeMessage("During evaluation of std")
@@ -1157,15 +1200,24 @@ func evaluateStd(i *interpreter) (value, error) {
 	node := astgen.StdAst
 	i.stack.setCurrentTrace(evalTrace)
 	defer i.stack.clearCurrentTrace()
-	return i.EvalInCleanEnv(&beforeStdEnv, node, false)
+	content, err := i.EvalInCleanEnv(&beforeStdEnv, node, false)
+	if err != nil {
+		return nil, err
+	}
+	stdThunk.content = content
+	return content, nil
 }
 
 func prepareExtVars(i *interpreter, ext vmExtMap, kind string) map[string]*cachedThunk {
 	result := make(map[string]*cachedThunk)
 	for name, content := range ext {
-		if content.isCode {
-			result[name] = codeToPV(i, "<"+kind+":"+name+">", content.value)
-		} else {
+		diagnosticFile := "<" + kind + ":" + name + ">"
+		switch content.kind {
+		case extKindCode:
+			result[name] = codeToPV(i, diagnosticFile, content.value)
+		case extKindNode:
+			result[name] = nodeToPV(i, diagnosticFile, content.node)
+		default:
 			result[name] = readyThunk(makeValueString(content.value))
 		}
 	}
@@ -1180,10 +1232,11 @@ func buildObject(hide ast.ObjectFieldHide, fields map[string]value) *valueObject
 	return makeValueSimpleObject(bindingFrame{}, fieldMap, nil, nil)
 }
 
-func buildInterpreter(ext vmExtMap, nativeFuncs map[string]*NativeFunction, maxStack int, ic *importCache) (*interpreter, error) {
+func buildInterpreter(ext vmExtMap, nativeFuncs map[string]*NativeFunction, maxStack int, ic *importCache, traceOut io.Writer) (*interpreter, error) {
 	i := interpreter{
 		stack:       makeCallStack(maxStack),
 		importCache: ic,
+		traceOut:    traceOut,
 		nativeFuncs: nativeFuncs,
 	}
 
@@ -1203,15 +1256,26 @@ func makeInitialEnv(filename string, baseStd *valueObject) environment {
 	fileSpecific := buildObject(ast.ObjectFieldHidden, map[string]value{
 		"thisFile": makeValueString(filename),
 	})
+
+	stdThunk := readyThunk(makeValueExtendedObject(baseStd, fileSpecific))
+
 	return makeEnvironment(
 		bindingFrame{
-			"std": readyThunk(makeValueExtendedObject(baseStd, fileSpecific)),
+			"std":  stdThunk,
+			"$std": stdThunk, // Unavailable to the user. To be used with desugaring.
 		},
 		makeUnboundSelfBinding(),
 	)
 }
 
-func evaluateAux(i *interpreter, node ast.Node, tla vmExtMap) (value, traceElement, error) {
+func manifestationTrace() traceElement {
+	manifestationLoc := ast.MakeLocationRangeMessage("During manifestation")
+	return traceElement{
+		loc: &manifestationLoc,
+	}
+}
+
+func evaluateAux(i *interpreter, node ast.Node, tla vmExtMap) (value, error) {
 	evalLoc := ast.MakeLocationRangeMessage("During evaluation")
 	evalTrace := traceElement{
 		loc: &evalLoc,
@@ -1221,7 +1285,7 @@ func evaluateAux(i *interpreter, node ast.Node, tla vmExtMap) (value, traceEleme
 	result, err := i.EvalInCleanEnv(&env, node, false)
 	i.stack.clearCurrentTrace()
 	if err != nil {
-		return nil, traceElement{}, err
+		return nil, err
 	}
 	// If it's not a function, ignore TLA
 	if f, ok := result.(*valueFunction); ok {
@@ -1238,32 +1302,28 @@ func evaluateAux(i *interpreter, node ast.Node, tla vmExtMap) (value, traceEleme
 		result, err = f.call(i, args)
 		i.stack.clearCurrentTrace()
 		if err != nil {
-			return nil, traceElement{}, err
+			return nil, err
 		}
 	}
-	manifestationLoc := ast.MakeLocationRangeMessage("During manifestation")
-	manifestationTrace := traceElement{
-		loc: &manifestationLoc,
-	}
-	return result, manifestationTrace, nil
+	return result, nil
 }
 
 // TODO(sbarzowski) this function takes far too many arguments - build interpreter in vm instead
 func evaluate(node ast.Node, ext vmExtMap, tla vmExtMap, nativeFuncs map[string]*NativeFunction,
-	maxStack int, ic *importCache, stringOutputMode bool) (string, error) {
+	maxStack int, ic *importCache, traceOut io.Writer, stringOutputMode bool) (string, error) {
 
-	i, err := buildInterpreter(ext, nativeFuncs, maxStack, ic)
+	i, err := buildInterpreter(ext, nativeFuncs, maxStack, ic, traceOut)
 	if err != nil {
 		return "", err
 	}
 
-	result, manifestationTrace, err := evaluateAux(i, node, tla)
+	result, err := evaluateAux(i, node, tla)
 	if err != nil {
 		return "", err
 	}
 
 	var buf bytes.Buffer
-	i.stack.setCurrentTrace(manifestationTrace)
+	i.stack.setCurrentTrace(manifestationTrace())
 	if stringOutputMode {
 		err = i.manifestString(&buf, result)
 	} else {
@@ -1279,19 +1339,19 @@ func evaluate(node ast.Node, ext vmExtMap, tla vmExtMap, nativeFuncs map[string]
 
 // TODO(sbarzowski) this function takes far too many arguments - build interpreter in vm instead
 func evaluateMulti(node ast.Node, ext vmExtMap, tla vmExtMap, nativeFuncs map[string]*NativeFunction,
-	maxStack int, ic *importCache, stringOutputMode bool) (map[string]string, error) {
+	maxStack int, ic *importCache, traceOut io.Writer, stringOutputMode bool) (map[string]string, error) {
 
-	i, err := buildInterpreter(ext, nativeFuncs, maxStack, ic)
+	i, err := buildInterpreter(ext, nativeFuncs, maxStack, ic, traceOut)
 	if err != nil {
 		return nil, err
 	}
 
-	result, manifestationTrace, err := evaluateAux(i, node, tla)
+	result, err := evaluateAux(i, node, tla)
 	if err != nil {
 		return nil, err
 	}
 
-	i.stack.setCurrentTrace(manifestationTrace)
+	i.stack.setCurrentTrace(manifestationTrace())
 	manifested, err := i.manifestAndSerializeMulti(result, stringOutputMode)
 	i.stack.clearCurrentTrace()
 	return manifested, err
@@ -1299,19 +1359,19 @@ func evaluateMulti(node ast.Node, ext vmExtMap, tla vmExtMap, nativeFuncs map[st
 
 // TODO(sbarzowski) this function takes far too many arguments - build interpreter in vm instead
 func evaluateStream(node ast.Node, ext vmExtMap, tla vmExtMap, nativeFuncs map[string]*NativeFunction,
-	maxStack int, ic *importCache) ([]string, error) {
+	maxStack int, ic *importCache, traceOut io.Writer) ([]string, error) {
 
-	i, err := buildInterpreter(ext, nativeFuncs, maxStack, ic)
+	i, err := buildInterpreter(ext, nativeFuncs, maxStack, ic, traceOut)
 	if err != nil {
 		return nil, err
 	}
 
-	result, manifestationTrace, err := evaluateAux(i, node, tla)
+	result, err := evaluateAux(i, node, tla)
 	if err != nil {
 		return nil, err
 	}
 
-	i.stack.setCurrentTrace(manifestationTrace)
+	i.stack.setCurrentTrace(manifestationTrace())
 	manifested, err := i.manifestAndSerializeYAMLStream(result)
 	i.stack.clearCurrentTrace()
 	return manifested, err

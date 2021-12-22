@@ -19,6 +19,7 @@ package jsonnet
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -44,15 +45,26 @@ type VM struct {
 	ErrorFormatter ErrorFormatter
 	StringOutput   bool
 	importCache    *importCache
+	traceOut       io.Writer
 }
+
+// extKind indicates the kind of external variable that is being initialized for the VM
+type extKind int
+
+const (
+	extKindVar  extKind = iota // a simple string
+	extKindCode                // a code snippet represented as a string
+	extKindNode                // an ast.Node that is passed in
+)
 
 // External variable or top level argument provided before execution
 type vmExt struct {
-	// jsonnet code to evaluate or string to pass
+	// the kind of external variable that is specified.
+	kind extKind
+	// jsonnet code to evaluate (kind=extKindCode) or string to pass (kind=extKindVar)
 	value string
-	// isCode determines whether it should be evaluated as jsonnet code or
-	// treated as string.
-	isCode bool
+	// the specified node for kind=extKindNode
+	node ast.Node
 }
 
 type vmExtMap map[string]vmExt
@@ -68,6 +80,7 @@ func MakeVM() *VM {
 		ErrorFormatter: &termErrorFormatter{pretty: false, maxStackTraceSize: 20},
 		importer:       &FileImporter{},
 		importCache:    makeImportCache(defaultImporter),
+		traceOut:       os.Stderr,
 	}
 }
 
@@ -83,21 +96,38 @@ func (vm *VM) flushValueCache() {
 	vm.importCache.flushValueCache()
 }
 
+// SetTraceOut sets the output stream for the builtin function std.trace().
+func (vm *VM) SetTraceOut(traceOut io.Writer) {
+	vm.traceOut = traceOut
+}
+
 // ExtVar binds a Jsonnet external var to the given value.
 func (vm *VM) ExtVar(key string, val string) {
-	vm.ext[key] = vmExt{value: val, isCode: false}
+	vm.ext[key] = vmExt{value: val, kind: extKindVar}
 	vm.flushValueCache()
 }
 
 // ExtCode binds a Jsonnet external code var to the given code.
 func (vm *VM) ExtCode(key string, val string) {
-	vm.ext[key] = vmExt{value: val, isCode: true}
+	vm.ext[key] = vmExt{value: val, kind: extKindCode}
+	vm.flushValueCache()
+}
+
+// ExtNode binds a Jsonnet external code var to the given AST node.
+func (vm *VM) ExtNode(key string, node ast.Node) {
+	vm.ext[key] = vmExt{node: node, kind: extKindNode}
+	vm.flushValueCache()
+}
+
+// ExtReset rests all external variables registered for this VM.
+func (vm *VM) ExtReset() {
+	vm.ext = make(vmExtMap)
 	vm.flushValueCache()
 }
 
 // TLAVar binds a Jsonnet top level argument to the given value.
 func (vm *VM) TLAVar(key string, val string) {
-	vm.tla[key] = vmExt{value: val, isCode: false}
+	vm.tla[key] = vmExt{value: val, kind: extKindVar}
 	// Setting a TLA does not require flushing the cache.
 	// Only the results of evaluation of imported files are cached
 	// and the TLAs do not affect these unlike extVars.
@@ -105,8 +135,19 @@ func (vm *VM) TLAVar(key string, val string) {
 
 // TLACode binds a Jsonnet top level argument to the given code.
 func (vm *VM) TLACode(key string, val string) {
-	vm.tla[key] = vmExt{value: val, isCode: true}
+	vm.tla[key] = vmExt{value: val, kind: extKindCode}
 	// Setting a TLA does not require flushing the cache - see above.
+}
+
+// TLANode binds a Jsonnet top level argument to the given AST node.
+func (vm *VM) TLANode(key string, node ast.Node) {
+	vm.tla[key] = vmExt{node: node, kind: extKindNode}
+	// Setting a TLA does not require flushing the cache - see above.
+}
+
+// TLAReset resets all TLAs registered for this VM.
+func (vm *VM) TLAReset() {
+	vm.tla = make(vmExtMap)
 }
 
 // Importer sets Importer to use during evaluation (import callback).
@@ -130,7 +171,7 @@ const (
 )
 
 // version is the current gojsonnet's version
-const version = "v0.17.0"
+const version = "v0.18.0"
 
 // Evaluate evaluates a Jsonnet program given by an Abstract Syntax Tree
 // and returns serialized JSON as string.
@@ -141,7 +182,7 @@ func (vm *VM) Evaluate(node ast.Node) (val string, err error) {
 			err = fmt.Errorf("(CRASH) %v\n%s", r, debug.Stack())
 		}
 	}()
-	return evaluate(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache, vm.StringOutput)
+	return evaluate(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache, vm.traceOut, vm.StringOutput)
 }
 
 // EvaluateStream evaluates a Jsonnet program given by an Abstract Syntax Tree
@@ -152,7 +193,7 @@ func (vm *VM) EvaluateStream(node ast.Node) (output []string, err error) {
 			err = fmt.Errorf("(CRASH) %v\n%s", r, debug.Stack())
 		}
 	}()
-	return evaluateStream(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache)
+	return evaluateStream(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache, vm.traceOut)
 }
 
 // EvaluateMulti evaluates a Jsonnet program given by an Abstract Syntax Tree
@@ -164,7 +205,7 @@ func (vm *VM) EvaluateMulti(node ast.Node) (output map[string]string, err error)
 			err = fmt.Errorf("(CRASH) %v\n%s", r, debug.Stack())
 		}
 	}()
-	return evaluateMulti(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache, vm.StringOutput)
+	return evaluateMulti(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache, vm.traceOut, vm.StringOutput)
 }
 
 func (vm *VM) evaluateSnippet(diagnosticFileName ast.DiagnosticFileName, filename string, snippet string, kind evalKind) (output interface{}, err error) {
@@ -179,11 +220,11 @@ func (vm *VM) evaluateSnippet(diagnosticFileName ast.DiagnosticFileName, filenam
 	}
 	switch kind {
 	case evalKindRegular:
-		output, err = evaluate(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache, vm.StringOutput)
+		output, err = evaluate(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache, vm.traceOut, vm.StringOutput)
 	case evalKindMulti:
-		output, err = evaluateMulti(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache, vm.StringOutput)
+		output, err = evaluateMulti(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache, vm.traceOut, vm.StringOutput)
 	case evalKindStream:
-		output, err = evaluateStream(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache)
+		output, err = evaluateStream(node, vm.ext, vm.tla, vm.nativeFuncs, vm.MaxStack, vm.importCache, vm.traceOut)
 	}
 	if err != nil {
 		return "", err

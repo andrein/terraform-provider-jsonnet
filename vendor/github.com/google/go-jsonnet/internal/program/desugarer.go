@@ -62,7 +62,12 @@ func desugarFields(nodeBase ast.NodeBase, fields *ast.ObjectFields, objLevel int
 			if msg == nil {
 				msg = buildLiteralString("Object assertion failed.")
 			}
-			onFailure := &ast.Error{Expr: msg}
+			onFailure := &ast.Error{
+				NodeBase: ast.NodeBase{
+					LocRange: field.LocRange,
+				},
+				Expr: msg,
+			}
 			asserts = append(asserts, &ast.Conditional{
 				NodeBase: ast.NodeBase{
 					LocRange: field.LocRange,
@@ -246,7 +251,7 @@ func buildSimpleIndex(obj ast.Node, member ast.Identifier) ast.Node {
 }
 
 func buildStdCall(builtinName ast.Identifier, loc ast.LocationRange, args ...ast.Node) ast.Node {
-	std := &ast.Var{Id: "std"}
+	std := &ast.Var{Id: "$std"}
 	builtin := buildSimpleIndex(std, builtinName)
 	positional := make([]ast.CommaSeparatedExpr, len(args))
 	for i := range args {

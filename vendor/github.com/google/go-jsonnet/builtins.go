@@ -23,8 +23,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
-	"os"
 	"reflect"
 	"sort"
 	"strconv"
@@ -248,10 +248,10 @@ func builtinTrace(i *interpreter, x value, y value) (value, error) {
 		return nil, err
 	}
 	trace := i.stack.currentTrace
-	filename := trace.loc.FileName
+	filename := trace.loc.File.DiagnosticFileName
 	line := trace.loc.Begin.Line
 	fmt.Fprintf(
-		os.Stderr, "TRACE: %s:%d %s\n", filename, line, xStr.getGoString())
+		i.traceOut, "TRACE: %s:%d %s\n", filename, line, xStr.getGoString())
 	return y, nil
 }
 
@@ -1195,6 +1195,34 @@ func builtinParseJSON(i *interpreter, str value) (value, error) {
 	return jsonToValue(i, parsedJSON)
 }
 
+func builtinParseYAML(i *interpreter, str value) (value, error) {
+	sval, err := i.getString(str)
+	if err != nil {
+		return nil, err
+	}
+	s := sval.getGoString()
+
+	isYamlStream := strings.Contains(s, "---")
+
+	elems := []interface{}{}
+	d := NewYAMLToJSONDecoder(strings.NewReader(s))
+	for {
+		var elem interface{}
+		if err := d.Decode(&elem); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, i.Error(fmt.Sprintf("failed to parse YAML: %v", err.Error()))
+		}
+		elems = append(elems, elem)
+	}
+
+	if isYamlStream {
+		return jsonToValue(i, elems)
+	}
+	return jsonToValue(i, elems[0])
+}
+
 func jsonEncode(v interface{}) (string, error) {
 	buf := new(bytes.Buffer)
 	enc := json.NewEncoder(buf)
@@ -1211,13 +1239,27 @@ func jsonEncode(v interface{}) (string, error) {
 // These should ideally be unified
 // For backwards compatibility reasons, we are manually marshalling to json so we can control formatting
 // In the future, it might be apt to use a library [pretty-printing] function
-func builtinManifestJSONEx(i *interpreter, obj, indent value) (value, error) {
-	vindent, err := i.getString(indent)
+func builtinManifestJSONEx(i *interpreter, arguments []value) (value, error) {
+	val := arguments[0]
+
+	vindent, err := i.getString(arguments[1])
+	if err != nil {
+		return nil, err
+	}
+
+	vnewline, err := i.getString(arguments[2])
+	if err != nil {
+		return nil, err
+	}
+
+	vkvSep, err := i.getString(arguments[3])
 	if err != nil {
 		return nil, err
 	}
 
 	sindent := vindent.getGoString()
+	newline := vnewline.getGoString()
+	kvSep := vkvSep.getGoString()
 
 	var path []string
 
@@ -1245,7 +1287,7 @@ func builtinManifestJSONEx(i *interpreter, obj, indent value) (value, error) {
 			return "", i.Error(fmt.Sprintf("tried to manifest function at %s", path))
 		case *valueArray:
 			newIndent := cindent + sindent
-			lines := []string{"[\n"}
+			lines := []string{"[" + newline}
 
 			var arrayLines []string
 			for aI, cThunk := range v.elements {
@@ -1261,12 +1303,12 @@ func builtinManifestJSONEx(i *interpreter, obj, indent value) (value, error) {
 				}
 				arrayLines = append(arrayLines, newIndent+s)
 			}
-			lines = append(lines, strings.Join(arrayLines, ",\n"))
-			lines = append(lines, "\n"+cindent+"]")
+			lines = append(lines, strings.Join(arrayLines, ","+newline))
+			lines = append(lines, newline+cindent+"]")
 			return strings.Join(lines, ""), nil
 		case *valueObject:
 			newIndent := cindent + sindent
-			lines := []string{"{\n"}
+			lines := []string{"{" + newline}
 
 			fields := objectFields(v, withoutHidden)
 			sort.Strings(fields)
@@ -1288,18 +1330,18 @@ func builtinManifestJSONEx(i *interpreter, obj, indent value) (value, error) {
 					return "", err
 				}
 
-				line := newIndent + string(fieldNameMarshalled) + ": " + mvs
+				line := newIndent + string(fieldNameMarshalled) + kvSep + mvs
 				objectLines = append(objectLines, line)
 			}
-			lines = append(lines, strings.Join(objectLines, ",\n"))
-			lines = append(lines, "\n"+cindent+"}")
+			lines = append(lines, strings.Join(objectLines, ","+newline))
+			lines = append(lines, newline+cindent+"}")
 			return strings.Join(lines, ""), nil
 		default:
 			return "", i.Error(fmt.Sprintf("unknown type to marshal to JSON: %s", reflect.TypeOf(v)))
 		}
 	}
 
-	finalString, err := aux(obj, path, "")
+	finalString, err := aux(val, path, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1607,7 +1649,10 @@ var funcBuiltins = buildBuiltinMap([]builtin{
 	&unaryBuiltin{name: "base64Decode", function: builtinBase64Decode, params: ast.Identifiers{"str"}},
 	&unaryBuiltin{name: "base64DecodeBytes", function: builtinBase64DecodeBytes, params: ast.Identifiers{"str"}},
 	&unaryBuiltin{name: "parseJson", function: builtinParseJSON, params: ast.Identifiers{"str"}},
-	&binaryBuiltin{name: "manifestJsonEx", function: builtinManifestJSONEx, params: ast.Identifiers{"value", "indent"}},
+	&unaryBuiltin{name: "parseYaml", function: builtinParseYAML, params: ast.Identifiers{"str"}},
+	&generalBuiltin{name: "manifestJsonEx", function: builtinManifestJSONEx, params: []generalBuiltinParameter{{name: "value"}, {name: "indent"},
+		{name: "newline", defaultValue: &valueFlatString{value: []rune("\n")}},
+		{name: "key_val_sep", defaultValue: &valueFlatString{value: []rune(": ")}}}},
 	&unaryBuiltin{name: "base64", function: builtinBase64, params: ast.Identifiers{"input"}},
 	&unaryBuiltin{name: "encodeUTF8", function: builtinEncodeUTF8, params: ast.Identifiers{"str"}},
 	&unaryBuiltin{name: "decodeUTF8", function: builtinDecodeUTF8, params: ast.Identifiers{"arr"}},
