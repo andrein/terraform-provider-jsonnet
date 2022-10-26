@@ -23,8 +23,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
-	"os"
 	"reflect"
 	"sort"
 	"strconv"
@@ -248,10 +248,10 @@ func builtinTrace(i *interpreter, x value, y value) (value, error) {
 		return nil, err
 	}
 	trace := i.stack.currentTrace
-	filename := trace.loc.FileName
+	filename := trace.loc.File.DiagnosticFileName
 	line := trace.loc.Begin.Line
 	fmt.Fprintf(
-		os.Stderr, "TRACE: %s:%d %s\n", filename, line, xStr.getGoString())
+		i.traceOut, "TRACE: %s:%d %s\n", filename, line, xStr.getGoString())
 	return y, nil
 }
 
@@ -260,9 +260,9 @@ func builtinTrace(i *interpreter, x value, y value) (value, error) {
 // time.  It is equivalent to `local i = 42; func(i)`.  It therefore has no
 // free variables and needs only an empty environment to execute.
 type astMakeArrayElement struct {
-	ast.NodeBase
 	function *valueFunction
-	index    int
+	ast.NodeBase
+	index int
 }
 
 func builtinMakeArray(i *interpreter, szv, funcv value) (value, error) {
@@ -396,6 +396,68 @@ func builtinJoin(i *interpreter, sep, arrv value) (value, error) {
 	}
 }
 
+func builtinFoldl(i *interpreter, funcv, arrv, initv value) (value, error) {
+	fun, err := i.getFunction(funcv)
+	if err != nil {
+		return nil, err
+	}
+	var numElements int
+	var elements []*cachedThunk
+	switch arrType := arrv.(type) {
+	case valueString:
+		for _, item := range arrType.getRunes() {
+			elements = append(elements, readyThunk(makeStringFromRunes([]rune{item})))
+		}
+		numElements = len(elements)
+	case *valueArray:
+		numElements = arrType.length()
+		elements = arrType.elements
+	default:
+		return nil, i.Error("foldl second parameter should be string or array, got " + arrType.getType().name)
+	}
+
+	accValue := initv
+	for counter := 0; counter < numElements; counter++ {
+		accValue, err = fun.call(i, args([]*cachedThunk{readyThunk(accValue), elements[counter]}...))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return accValue, nil
+}
+
+func builtinFoldr(i *interpreter, funcv, arrv, initv value) (value, error) {
+	fun, err := i.getFunction(funcv)
+	if err != nil {
+		return nil, err
+	}
+	var numElements int
+	var elements []*cachedThunk
+	switch arrType := arrv.(type) {
+	case valueString:
+		for _, item := range arrType.getRunes() {
+			elements = append(elements, readyThunk(makeStringFromRunes([]rune{item})))
+		}
+		numElements = len(elements)
+	case *valueArray:
+		numElements = arrType.length()
+		elements = arrType.elements
+	default:
+		return nil, i.Error("foldr second parameter should be string or array, got " + arrType.getType().name)
+	}
+
+	accValue := initv
+	for counter := numElements - 1; counter >= 0; counter-- {
+		accValue, err = fun.call(i, args([]*cachedThunk{elements[counter], readyThunk(accValue)}...))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return accValue, nil
+}
+
 func builtinReverse(i *interpreter, arrv value) (value, error) {
 	arr, err := i.getArray(arrv)
 	if err != nil {
@@ -442,12 +504,114 @@ func builtinFilter(i *interpreter, funcv, arrv value) (value, error) {
 	}
 	return makeValueArray(elems), nil
 }
+func builtinLstripChars(i *interpreter, str, chars value) (value, error) {
+	switch strType := str.(type) {
+	case valueString:
+		if strType.length() > 0 {
+			index, err := strType.index(i, 0)
+			if err != nil {
+				return nil, err
+			}
+			member, err := rawMember(i, chars, index)
+			if err != nil {
+				return nil, err
+			}
+			if member {
+				s := strType.getGoString()[1:]
+				return builtinLstripChars(i, makeValueString(s), chars)
+			} else {
+				return str, nil
+			}
+		}
+		return str, nil
+	default:
+		return nil, i.Error(fmt.Sprintf("Unexpected type %s, expected string", strType.getType().name))
+	}
+}
+
+func builtinRstripChars(i *interpreter, str, chars value) (value, error) {
+	switch strType := str.(type) {
+	case valueString:
+		if strType.length() > 0 {
+			index, err := strType.index(i, strType.length()-1)
+			if err != nil {
+				return nil, err
+			}
+			member, err := rawMember(i, chars, index)
+			if err != nil {
+				return nil, err
+			}
+			if member {
+				s := strType.getGoString()[:strType.length()-1]
+				return builtinRstripChars(i, makeValueString(s), chars)
+			} else {
+				return str, nil
+			}
+		}
+		return str, nil
+	default:
+		return nil, i.Error(fmt.Sprintf("Unexpected type %s, expected string", strType.getType().name))
+	}
+}
+
+func builtinStripChars(i *interpreter, str, chars value) (value, error) {
+	lstripChars, err := builtinLstripChars(i, str, chars)
+	if err != nil {
+		return nil, err
+	}
+	rstripChars, err := builtinRstripChars(i, lstripChars, chars)
+	if err != nil {
+		return nil, err
+	}
+	return rstripChars, nil
+}
+
+func rawMember(i *interpreter, arrv, value value) (bool, error) {
+	switch arrType := arrv.(type) {
+	case valueString:
+		valString, err := i.getString(value)
+		if err != nil {
+			return false, err
+		}
+		for _, char := range arrType.getRunes() {
+			if string(char) == valString.getGoString() {
+				return true, nil
+			}
+		}
+		return false, nil
+	case *valueArray:
+		for _, elem := range arrType.elements {
+			cachedThunkValue, err := elem.getValue(i)
+			if err != nil {
+				return false, err
+			}
+			equal, err := rawEquals(i, cachedThunkValue, value)
+			if err != nil {
+				return false, err
+			}
+			if equal {
+				return true, nil
+			}
+		}
+	default:
+		return false, i.Error("std.member first argument must be an array or a string")
+	}
+	return false, nil
+}
+
+func builtinMember(i *interpreter, arrv, value value) (value, error) {
+	eq, err := rawMember(i, arrv, value)
+	if err != nil {
+		return nil, err
+	}
+	return makeValueBoolean(eq), nil
+}
 
 type sortData struct {
+	err    error
 	i      *interpreter
 	thunks []*cachedThunk
 	keys   []value
-	err    error
 }
 
 func (d *sortData) Len() int {
@@ -991,6 +1155,11 @@ func builtinSubstr(i *interpreter, inputStr, inputFrom, inputLen value) (value, 
 		return nil, makeRuntimeError(msg, i.getCurrentStackTrace())
 	}
 
+	if fromV.value < 0 {
+		msg := fmt.Sprintf("substr second parameter should be greater than zero, got %f", fromV.value)
+		return nil, makeRuntimeError(msg, i.getCurrentStackTrace())
+	}
+
 	lenV, err := i.getNumber(inputLen)
 	if err != nil {
 		msg := fmt.Sprintf("substr third parameter should be a number, got %s", inputLen.getType().name)
@@ -1010,7 +1179,7 @@ func builtinSubstr(i *interpreter, inputStr, inputFrom, inputLen value) (value, 
 	}
 
 	fromInt := int(fromV.value)
-	strStr := strV.getGoString()
+	strStr := strV.getRunes()
 
 	endIndex := fromInt + lenInt
 
@@ -1021,9 +1190,7 @@ func builtinSubstr(i *interpreter, inputStr, inputFrom, inputLen value) (value, 
 	if fromInt > len(strStr) {
 		return makeValueString(""), nil
 	}
-
-	runes := []rune(strStr)
-	return makeValueString(string(runes[fromInt:endIndex])), nil
+	return makeValueString(string(strStr[fromInt:endIndex])), nil
 }
 
 func builtinSplitLimit(i *interpreter, strv, cv, maxSplitsV value) (value, error) {
@@ -1044,8 +1211,8 @@ func builtinSplitLimit(i *interpreter, strv, cv, maxSplitsV value) (value, error
 	}
 	sStr := str.getGoString()
 	sC := c.getGoString()
-	if len(sC) != 1 {
-		return nil, i.Error(fmt.Sprintf("std.splitLimit second parameter should have length 1, got %v", len(sC)))
+	if len(sC) < 1 {
+		return nil, i.Error(fmt.Sprintf("std.splitLimit second parameter should have length 1 or greater, got %v", len(sC)))
 	}
 
 	// the convention is slightly different from strings.splitN in Go (the meaning of non-negative values is shifted by one)
@@ -1195,6 +1362,34 @@ func builtinParseJSON(i *interpreter, str value) (value, error) {
 	return jsonToValue(i, parsedJSON)
 }
 
+func builtinParseYAML(i *interpreter, str value) (value, error) {
+	sval, err := i.getString(str)
+	if err != nil {
+		return nil, err
+	}
+	s := sval.getGoString()
+
+	isYamlStream := strings.Contains(s, "---")
+
+	elems := []interface{}{}
+	d := NewYAMLToJSONDecoder(strings.NewReader(s))
+	for {
+		var elem interface{}
+		if err := d.Decode(&elem); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, i.Error(fmt.Sprintf("failed to parse YAML: %v", err.Error()))
+		}
+		elems = append(elems, elem)
+	}
+
+	if isYamlStream {
+		return jsonToValue(i, elems)
+	}
+	return jsonToValue(i, elems[0])
+}
+
 func jsonEncode(v interface{}) (string, error) {
 	buf := new(bytes.Buffer)
 	enc := json.NewEncoder(buf)
@@ -1207,17 +1402,373 @@ func jsonEncode(v interface{}) (string, error) {
 	return strings.TrimRight(buf.String(), "\n"), nil
 }
 
+// tomlIsSection checks whether an object or array is a section - a TOML section is an
+// object or an an array has all of its children being objects
+func tomlIsSection(i *interpreter, val value) (bool, error) {
+	switch v := val.(type) {
+	case *valueObject:
+		return true, nil
+	case *valueArray:
+		if v.length() == 0 {
+			return false, nil
+		}
+
+		for _, thunk := range v.elements {
+			thunkValue, err := thunk.getValue(i)
+			if err != nil {
+				return false, err
+			}
+
+			switch thunkValue.(type) {
+			case *valueObject:
+				// this is expected, return true if all children are objects
+			default:
+				// return false if at least one child is not an object
+				return false, nil
+			}
+		}
+
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+// tomlEncodeString encodes a string as quoted TOML string
+func tomlEncodeString(s string) string {
+	res := "\""
+
+	for _, c := range s {
+		// escape specific characters, rendering non-ASCII ones as \uXXXX,
+		// appending remaining characters as is
+		if c == '"' {
+			res = res + "\\\""
+		} else if c == '\\' {
+			res = res + "\\\\"
+		} else if c == '\b' {
+			res = res + "\\b"
+		} else if c == '\f' {
+			res = res + "\\f"
+		} else if c == '\n' {
+			res = res + "\\n"
+		} else if c == '\r' {
+			res = res + "\\r"
+		} else if c == '\t' {
+			res = res + "\\t"
+		} else if c < 32 || (c >= 127 && c <= 159) {
+			res = res + fmt.Sprintf("\\u%04x", c)
+		} else {
+			res = res + string(c)
+		}
+	}
+
+	res = res + "\""
+
+	return res
+}
+
+// tomlEncodeKey encodes a key - returning same string if it does not need quoting,
+// otherwise return it quoted; returns empty key as ''
+func tomlEncodeKey(s string) string {
+	bareAllowed := true
+
+	// for empty string, return ''
+	if len(s) == 0 {
+		return "''"
+	}
+
+	for _, c := range s {
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
+			continue
+		}
+
+		bareAllowed = false
+		break
+	}
+
+	if bareAllowed {
+		return s
+	}
+	return tomlEncodeString(s)
+}
+
+func tomlAddToPath(path []string, tail string) []string {
+	result := make([]string, 0, len(path)+1)
+	result = append(result, path...)
+	result = append(result, tail)
+	return result
+}
+
+// tomlRenderValue returns a rendered value as string, with proper indenting
+func tomlRenderValue(i *interpreter, val value, sindent string, indexedPath []string, inline bool, cindent string) (string, error) {
+	switch v := val.(type) {
+	case *valueNull:
+		return "", i.Error(fmt.Sprintf("Tried to manifest \"null\" at %v", indexedPath))
+	case *valueBoolean:
+		return fmt.Sprintf("%t", v.value), nil
+	case *valueNumber:
+		return unparseNumber(v.value), nil
+	case valueString:
+		return tomlEncodeString(v.getGoString()), nil
+	case *valueFunction:
+		return "", i.Error(fmt.Sprintf("Tried to manifest function at %v", indexedPath))
+	case *valueArray:
+		if len(v.elements) == 0 {
+			return "[]", nil
+		}
+
+		// initialize indenting and separators based on whether this is added inline or not
+		newIndent := cindent + sindent
+		separator := "\n"
+		if inline {
+			newIndent = ""
+			separator = " "
+		}
+
+		// open the square bracket to start array values
+		res := "[" + separator
+
+		// iterate over elents and add their values to result
+		for j, thunk := range v.elements {
+			thunkValue, err := thunk.getValue(i)
+			if err != nil {
+				return "", err
+			}
+
+			childIndexedPath := tomlAddToPath(indexedPath, strconv.FormatInt(int64(j), 10))
+
+			if j > 0 {
+				res = res + "," + separator
+			}
+
+			res = res + newIndent
+			value, err := tomlRenderValue(i, thunkValue, sindent, childIndexedPath, true, "")
+			if err != nil {
+				return "", err
+			}
+			res = res + value
+		}
+
+		res = res + separator
+		if inline {
+			res = res + cindent
+		}
+
+		// close the array and return it
+		res = res + "]"
+
+		return res, nil
+	case *valueObject:
+		res := ""
+
+		fields := objectFields(v, withoutHidden)
+		sort.Strings(fields)
+
+		// iterate over sorted field keys and render their values
+		for j, fieldName := range fields {
+			fieldValue, err := v.index(i, fieldName)
+			if err != nil {
+				return "", err
+			}
+
+			childIndexedPath := tomlAddToPath(indexedPath, fieldName)
+
+			value, err := tomlRenderValue(i, fieldValue, sindent, childIndexedPath, true, "")
+			if err != nil {
+				return "", err
+			}
+
+			if j > 0 {
+				res = res + ", "
+			}
+			res = res + tomlEncodeKey(fieldName) + " = " + value
+		}
+
+		// wrap fields in an array
+		return "{ " + res + " }", nil
+	default:
+		return "", i.Error(fmt.Sprintf("Unknown object type %v at %v", reflect.TypeOf(v), indexedPath))
+	}
+}
+
+func tomlRenderTableArray(i *interpreter, v *valueArray, sindent string, path []string, indexedPath []string, cindent string) (string, error) {
+
+	sections := make([]string, 0, len(v.elements))
+
+	// render all elements of an array
+	for j, thunk := range v.elements {
+		thunkValue, err := thunk.getValue(i)
+		if err != nil {
+			return "", err
+		}
+
+		switch tv := thunkValue.(type) {
+		case *valueObject:
+			// render the entire path as section name
+			section := cindent + "[["
+
+			for i, element := range path {
+				if i > 0 {
+					section = section + "."
+				}
+				section = section + tomlEncodeKey(element)
+			}
+
+			section = section + "]]"
+
+			// add newline if the table has elements
+			if len(objectFields(tv, withoutHidden)) > 0 {
+				section = section + "\n"
+			}
+
+			childIndexedPath := tomlAddToPath(indexedPath, strconv.FormatInt(int64(j), 10))
+
+			// render the table and add it to result
+			table, err := tomlTableInternal(i, tv, sindent, path, childIndexedPath, cindent+sindent)
+			if err != nil {
+				return "", err
+			}
+			section = section + table
+
+			sections = append(sections, section)
+		default:
+			return "", i.Error(fmt.Sprintf("invalid type for section: %v", reflect.TypeOf(thunkValue)))
+		}
+	}
+
+	// combine all sections
+	return strings.Join(sections, "\n\n"), nil
+}
+
+func tomlRenderTable(i *interpreter, v *valueObject, sindent string, path []string, indexedPath []string, cindent string) (string, error) {
+	res := cindent + "["
+	for i, element := range path {
+		if i > 0 {
+			res = res + "."
+		}
+		res = res + tomlEncodeKey(element)
+	}
+	res = res + "]"
+	if len(objectFields(v, withoutHidden)) > 0 {
+		res = res + "\n"
+	}
+
+	table, err := tomlTableInternal(i, v, sindent, path, indexedPath, cindent+sindent)
+	if err != nil {
+		return "", err
+	}
+	res = res + table
+
+	return res, nil
+}
+
+func tomlTableInternal(i *interpreter, v *valueObject, sindent string, path []string, indexedPath []string, cindent string) (string, error) {
+	resFields := []string{}
+	resSections := []string{""}
+	fields := objectFields(v, withoutHidden)
+	sort.Strings(fields)
+
+	// iterate over non-section items
+	for _, fieldName := range fields {
+		fieldValue, err := v.index(i, fieldName)
+		if err != nil {
+			return "", err
+		}
+
+		isSection, err := tomlIsSection(i, fieldValue)
+		if err != nil {
+			return "", err
+		}
+
+		childIndexedPath := tomlAddToPath(indexedPath, fieldName)
+
+		if isSection {
+			// render as section and add to array of sections
+
+			childPath := tomlAddToPath(path, fieldName)
+
+			switch fv := fieldValue.(type) {
+			case *valueObject:
+				section, err := tomlRenderTable(i, fv, sindent, childPath, childIndexedPath, cindent)
+				if err != nil {
+					return "", err
+				}
+				resSections = append(resSections, section)
+			case *valueArray:
+				section, err := tomlRenderTableArray(i, fv, sindent, childPath, childIndexedPath, cindent)
+				if err != nil {
+					return "", err
+				}
+				resSections = append(resSections, section)
+			default:
+				return "", i.Error(fmt.Sprintf("invalid type for section: %v", reflect.TypeOf(fieldValue)))
+			}
+		} else {
+			// render as value and append to result fields
+
+			renderedValue, err := tomlRenderValue(i, fieldValue, sindent, childIndexedPath, false, "")
+			if err != nil {
+				return "", err
+			}
+			resFields = append(resFields, strings.Split(tomlEncodeKey(fieldName)+" = "+renderedValue, "\n")...)
+		}
+	}
+
+	// create the result string
+	res := ""
+
+	if len(resFields) > 0 {
+		res = "" + cindent
+	}
+	res = res + strings.Join(resFields, "\n"+cindent) + strings.Join(resSections, "\n\n")
+	return res, nil
+}
+
+func builtinManifestTomlEx(i *interpreter, arguments []value) (value, error) {
+	val := arguments[0]
+	vindent, err := i.getString(arguments[1])
+	if err != nil {
+		return nil, err
+	}
+	sindent := vindent.getGoString()
+
+	switch v := val.(type) {
+	case *valueObject:
+		res, err := tomlTableInternal(i, v, sindent, []string{}, []string{}, "")
+		if err != nil {
+			return nil, err
+		}
+		return makeValueString(res), nil
+	default:
+		return nil, i.Error(fmt.Sprintf("TOML body must be an object. Got %s", v.getType().name))
+	}
+}
+
 // We have a very similar logic here /interpreter.go@v0.16.0#L695 and here: /interpreter.go@v0.16.0#L627
 // These should ideally be unified
 // For backwards compatibility reasons, we are manually marshalling to json so we can control formatting
 // In the future, it might be apt to use a library [pretty-printing] function
-func builtinManifestJSONEx(i *interpreter, obj, indent value) (value, error) {
-	vindent, err := i.getString(indent)
+func builtinManifestJSONEx(i *interpreter, arguments []value) (value, error) {
+	val := arguments[0]
+
+	vindent, err := i.getString(arguments[1])
+	if err != nil {
+		return nil, err
+	}
+
+	vnewline, err := i.getString(arguments[2])
+	if err != nil {
+		return nil, err
+	}
+
+	vkvSep, err := i.getString(arguments[3])
 	if err != nil {
 		return nil, err
 	}
 
 	sindent := vindent.getGoString()
+	newline := vnewline.getGoString()
+	kvSep := vkvSep.getGoString()
 
 	var path []string
 
@@ -1245,7 +1796,7 @@ func builtinManifestJSONEx(i *interpreter, obj, indent value) (value, error) {
 			return "", i.Error(fmt.Sprintf("tried to manifest function at %s", path))
 		case *valueArray:
 			newIndent := cindent + sindent
-			lines := []string{"[\n"}
+			lines := []string{"[" + newline}
 
 			var arrayLines []string
 			for aI, cThunk := range v.elements {
@@ -1261,12 +1812,12 @@ func builtinManifestJSONEx(i *interpreter, obj, indent value) (value, error) {
 				}
 				arrayLines = append(arrayLines, newIndent+s)
 			}
-			lines = append(lines, strings.Join(arrayLines, ",\n"))
-			lines = append(lines, "\n"+cindent+"]")
+			lines = append(lines, strings.Join(arrayLines, ","+newline))
+			lines = append(lines, newline+cindent+"]")
 			return strings.Join(lines, ""), nil
 		case *valueObject:
 			newIndent := cindent + sindent
-			lines := []string{"{\n"}
+			lines := []string{"{" + newline}
 
 			fields := objectFields(v, withoutHidden)
 			sort.Strings(fields)
@@ -1288,18 +1839,18 @@ func builtinManifestJSONEx(i *interpreter, obj, indent value) (value, error) {
 					return "", err
 				}
 
-				line := newIndent + string(fieldNameMarshalled) + ": " + mvs
+				line := newIndent + string(fieldNameMarshalled) + kvSep + mvs
 				objectLines = append(objectLines, line)
 			}
-			lines = append(lines, strings.Join(objectLines, ",\n"))
-			lines = append(lines, "\n"+cindent+"}")
+			lines = append(lines, strings.Join(objectLines, ","+newline))
+			lines = append(lines, newline+cindent+"}")
 			return strings.Join(lines, ""), nil
 		default:
 			return "", i.Error(fmt.Sprintf("unknown type to marshal to JSON: %s", reflect.TypeOf(v)))
 		}
 	}
 
-	finalString, err := aux(obj, path, "")
+	finalString, err := aux(val, path, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1339,7 +1890,7 @@ type builtin interface {
 }
 
 func flattenArgs(args callArguments, params []namedParameter, defaults []value) []*cachedThunk {
-	positions := make(map[ast.Identifier]int)
+	positions := make(map[ast.Identifier]int, len(params))
 	for i, param := range params {
 		positions[param.name] = i
 	}
@@ -1466,10 +2017,10 @@ func (b *ternaryBuiltin) Name() ast.Identifier {
 type generalBuiltinFunc func(*interpreter, []value) (value, error)
 
 type generalBuiltinParameter struct {
-	name ast.Identifier
 	// Note that the defaults are passed as values rather than AST nodes like in Parameters.
 	// This spares us unnecessary evaluation.
 	defaultValue value
+	name         ast.Identifier
 }
 
 // generalBuiltin covers cases that other builtin structures do not,
@@ -1478,8 +2029,8 @@ type generalBuiltinParameter struct {
 // at the same index.
 type generalBuiltin struct {
 	name     ast.Identifier
-	params   []generalBuiltinParameter
 	function generalBuiltinFunc
+	params   []generalBuiltinParameter
 }
 
 func (b *generalBuiltin) parameters() []namedParameter {
@@ -1559,11 +2110,23 @@ var uopBuiltins = []*unaryBuiltin{
 }
 
 func buildBuiltinMap(builtins []builtin) map[string]evalCallable {
-	result := make(map[string]evalCallable)
+	result := make(map[string]evalCallable, len(builtins))
 	for _, b := range builtins {
 		result[string(b.Name())] = b
 	}
 	return result
+}
+
+func builtinParseInt(i *interpreter, x value) (value, error) {
+	str, err := i.getString(x)
+	if err != nil {
+		return nil, err
+	}
+	res, err := strconv.ParseInt(str.getGoString(), 10, 64)
+	if err != nil {
+		return nil, i.Error(fmt.Sprintf("%s is not a base 10 integer", str.getGoString()))
+	}
+	return makeValueNumber(float64(res)), nil
 }
 
 var funcBuiltins = buildBuiltinMap([]builtin{
@@ -1577,6 +2140,9 @@ var funcBuiltins = buildBuiltinMap([]builtin{
 	&binaryBuiltin{name: "join", function: builtinJoin, params: ast.Identifiers{"sep", "arr"}},
 	&unaryBuiltin{name: "reverse", function: builtinReverse, params: ast.Identifiers{"arr"}},
 	&binaryBuiltin{name: "filter", function: builtinFilter, params: ast.Identifiers{"func", "arr"}},
+	&ternaryBuiltin{name: "foldl", function: builtinFoldl, params: ast.Identifiers{"func", "arr", "init"}},
+	&ternaryBuiltin{name: "foldr", function: builtinFoldr, params: ast.Identifiers{"func", "arr", "init"}},
+	&binaryBuiltin{name: "member", function: builtinMember, params: ast.Identifiers{"arr", "x"}},
 	&binaryBuiltin{name: "range", function: builtinRange, params: ast.Identifiers{"from", "to"}},
 	&binaryBuiltin{name: "primitiveEquals", function: primitiveEquals, params: ast.Identifiers{"x", "y"}},
 	&binaryBuiltin{name: "equals", function: builtinEquals, params: ast.Identifiers{"x", "y"}},
@@ -1601,13 +2167,21 @@ var funcBuiltins = buildBuiltinMap([]builtin{
 	&binaryBuiltin{name: "pow", function: builtinPow, params: ast.Identifiers{"x", "n"}},
 	&binaryBuiltin{name: "modulo", function: builtinModulo, params: ast.Identifiers{"x", "y"}},
 	&unaryBuiltin{name: "md5", function: builtinMd5, params: ast.Identifiers{"s"}},
+	&binaryBuiltin{name: "lstripChars", function: builtinLstripChars, params: ast.Identifiers{"str", "chars"}},
+	&binaryBuiltin{name: "rstripChars", function: builtinRstripChars, params: ast.Identifiers{"str", "chars"}},
+	&binaryBuiltin{name: "stripChars", function: builtinStripChars, params: ast.Identifiers{"str", "chars"}},
 	&ternaryBuiltin{name: "substr", function: builtinSubstr, params: ast.Identifiers{"str", "from", "len"}},
 	&ternaryBuiltin{name: "splitLimit", function: builtinSplitLimit, params: ast.Identifiers{"str", "c", "maxsplits"}},
 	&ternaryBuiltin{name: "strReplace", function: builtinStrReplace, params: ast.Identifiers{"str", "from", "to"}},
 	&unaryBuiltin{name: "base64Decode", function: builtinBase64Decode, params: ast.Identifiers{"str"}},
 	&unaryBuiltin{name: "base64DecodeBytes", function: builtinBase64DecodeBytes, params: ast.Identifiers{"str"}},
+	&unaryBuiltin{name: "parseInt", function: builtinParseInt, params: ast.Identifiers{"str"}},
 	&unaryBuiltin{name: "parseJson", function: builtinParseJSON, params: ast.Identifiers{"str"}},
-	&binaryBuiltin{name: "manifestJsonEx", function: builtinManifestJSONEx, params: ast.Identifiers{"value", "indent"}},
+	&unaryBuiltin{name: "parseYaml", function: builtinParseYAML, params: ast.Identifiers{"str"}},
+	&generalBuiltin{name: "manifestJsonEx", function: builtinManifestJSONEx, params: []generalBuiltinParameter{{name: "value"}, {name: "indent"},
+		{name: "newline", defaultValue: &valueFlatString{value: []rune("\n")}},
+		{name: "key_val_sep", defaultValue: &valueFlatString{value: []rune(": ")}}}},
+	&generalBuiltin{name: "manifestTomlEx", function: builtinManifestTomlEx, params: []generalBuiltinParameter{{name: "value"}, {name: "indent"}}},
 	&unaryBuiltin{name: "base64", function: builtinBase64, params: ast.Identifiers{"input"}},
 	&unaryBuiltin{name: "encodeUTF8", function: builtinEncodeUTF8, params: ast.Identifiers{"str"}},
 	&unaryBuiltin{name: "decodeUTF8", function: builtinDecodeUTF8, params: ast.Identifiers{"arr"}},
